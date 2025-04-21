@@ -1,7 +1,7 @@
-prom-scopedb-adaptor stores timeseries data in ClickHouse.
+prom-scopedb-adaptor stores timeseries data in ScopeDB.
 
 Implements both Prometheus remote writer (to store metrics) and
-Prometheus remote reader (use metrics from ClickHouse directly in Prometheus)
+Prometheus remote reader (use metrics from ScopeDB directly in Prometheus)
 
 ### Install
 
@@ -21,16 +21,8 @@ CREATE TABLE metrics.samples
     `labels` Variant,
     `value` float,
 )
-ORDER BY (metric_name, labels, updated_at)
+CLUSTER BY (metric_name, labels, updated_at)
 ```
-
-This works well with over 30 billion metrics, even when searching by label,
-although cardinality of my dataset is low at 16032 unique metrics+labels.
-Including label values, it takes approximately 1 byte per value for my dataset (1 gigabyte per billion metrics)
-
-The `labelset` index granularity is set to 8192 (8192*8192 rows) on purpose for
-queries like `has(labels, 'job=omada')` while still providing performance with
-many rows that match.
 
 ### Configure Prometheus remote writer
 
@@ -43,7 +35,7 @@ remote_write:
      max_samples_per_send: 10000
 ```
 
-ClickHouse prefers fewer writes with more samples per write.  Above a certain
+It prefers fewer writes with more samples per write.  Above a certain
 rate you may need to adjust Prometheus `capacity` and
 `max_samples_per_send` as per [Prometheus Remote Write Tuning](https://prometheus.io/docs/practices/remote_write/) if you see "Too many parts" errors or `prometheus_remote_storage_samples_pending` keeps growing.
 
@@ -68,100 +60,12 @@ this configuration:
 remote_read:
  - url: "http://localhost:9131/read"
    read_recent: true
-   name: clickhouse
+   name: scopedb
    required_matchers:
-     remote: clickhouse
+     remote: scopedb
 ```
 
-Then issue queries with the added `{remote="clickhouse"}` label.
+Then issue queries with the added `{remote="scopedb"}` label.
 
-`prom-scopedb-adaptor` will remove the `{remote="clickhouse"}` label
+`prom-scopedb-adaptor` will remove the `{remote="scopedb"}` label
 from incoming requests by default, see `--help`.
-
-### Query directly with Grafana
-
-I recommend querying through Prometheus `remote_read`, but it is possible to read the ClickHouse
-data directly from Grafana with the [ClickHouse Data Plugin](https://grafana.com/grafana/plugins/grafana-clickhouse-datasource/)
-
-Sample ClickHouse Data Plugin direct queries:
-
-```
-$perSecondColumns(arrayConcat([metric_name], labels), value)
-FROM metrics.samples
-WHERE
-    metric_name='go_memstats_alloc_bytes_total'
-    AND has(labels, 'job=omada')
-```
-
-```
-$perSecondColumns(arrayConcat([metric_name], arrayFilter(x -> x LIKE 'name=%', labels)), value * 8)
-FROM metrics.samples
-WHERE
-    metric_name='omada_station_transmit_bytes_total'
-```
-
-```
-SELECT
-    $timeSeries as t,
-    metric_name,
-    labels,
-    max(value)
-FROM $table
-WHERE
-    metric_name='go_goroutines'
-    AND has(labels, 'job=omada')
-    AND $timeFilter
-GROUP BY
-    metric_name,
-    labels,
-    t
-ORDER BY t
-```
-
-```
-SELECT
-    t,
-    if(runningDifference(max_0) < 0, nan, runningDifference(max_0) / runningDifference(t / 1000)) AS max_0_Rate
-FROM
-(
-    SELECT
-        $timeSeries AS t,
-        max(value) as max_0
-    FROM $table
-    WHERE metric_name='go_memstats_alloc_bytes_total'
-    AND has(labels, 'job=omada')
-    AND $timeFilter
-    GROUP BY t
-    ORDER BY t
-)
-```
-
-### Importing existing data
-
-You may export TSDB data from Prometheus and reinsert it into ClickHouse.
-
-Use a [modified `promtool` command](https://github.com/prometheus/prometheus/compare/main...jamessanford:prometheus:jamessanford/promtool-clickhouse) to dump one day at a time.
-
-Note that `promtool tsdb` writes to your TSDB directory, so run it
-against a read-only snapshot.
-
-
-```
-promtool tsdb dump \
-  --min-time=$(date -u -d '2021-12-16' +%s)001 \
-  --max-time=$(date -u -d '2021-12-17' +%s)000 \
-  /zfs/tsdbsnap1/jsanford/prom2/bin/data \
-|  clickhouse client \
-  --query 'INSERT INTO metrics.samples FORMAT TabSeparated'
-```
-
-You may significantly speed up the bulk import by running many in parallel.
-
-Importing one day a time makes it easy to delete and reimport data, eg
-
-```
-ALTER TABLE metrics.samples DELETE WHERE updated_at > 1656806400 AND updated_at <= 1656892800
-```
-
-Let ClickHouse settle for 30 minutes or so after bulk importing data
-before determining what CPU usage will look like long term.
